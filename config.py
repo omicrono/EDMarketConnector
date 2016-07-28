@@ -86,6 +86,8 @@ class Config:
     OUT_SYS_EDSM      = 256
     # OUT_SYS_AUTO    = 512	# Now always automatic
     OUT_MKT_MANUAL    = 1024
+    OUT_SYS_EDDN      = 2048
+    OUT_SYS_DELAY     = 4096
 
     if platform=='darwin':
 
