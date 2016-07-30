@@ -9,7 +9,8 @@ from os import mkdir
 from os.path import expanduser, isdir, join
 import re
 import requests
-from time import time, localtime, strftime
+from time import time, localtime, strftime, strptime
+from calendar import timegm
 
 import Tkinter as tk
 import ttk
@@ -70,8 +71,11 @@ class AppWindow:
         self.w.rowconfigure(0, weight=1)
         self.w.columnconfigure(0, weight=1)
 
-        # Special handling for overrideredict
-        self.w.bind("<Map>", self.onmap)
+        # Context for journal handling
+        self.journal_version = None
+        self.journal_mode = None
+        self.journal_build = None
+        self.journal_cmdr = None
 
         plug.load_plugins()
 
@@ -237,6 +241,9 @@ class AppWindow:
         theme.register_highlight(self.station)
         theme.apply(self.w)
 
+        # Special handling for overrideredict
+        self.w.bind("<Map>", self.onmap)
+
         # Load updater after UI creation (for WinSparkle)
         import update
         self.updater = update.Updater(self.w)
@@ -247,8 +254,7 @@ class AppWindow:
         hotkeymgr.register(self.w, config.getint('hotkey_code'), config.getint('hotkey_mods'))
 
         # Install log monitoring
-        monitor.set_callback('Dock', self.getandsend)
-        monitor.set_callback('Jump', self.system_change)
+        self.w.bind_all('<<JournalEvent>>', self.journal_event)	# user-generated
         monitor.start(self.w)
 
         # First run
@@ -324,7 +330,8 @@ class AppWindow:
 
     def getandsend(self, event=None, retrying=False):
 
-        play_sound = event and event.type=='35' and not config.getint('hotkey_mute')
+        # journal/after() or hotkey/event_generate()
+        play_sound = (not event or event.type=='35') and not config.getint('hotkey_mute')
 
         if not retrying:
             if time() < self.holdofftime:	# Was invoked by key while in cooldown
@@ -367,10 +374,6 @@ class AppWindow:
                 self.status['text'] = ''
                 self.edit_menu.entryconfigure(0, state=tk.NORMAL)	# Copy
 
-                if data['lastStarport'].get('commodities'):
-                    # Fixup anomalies in the commodity data
-                    self.session.fixup(data['lastStarport']['commodities'])
-
                 # stuff we can do when not docked
                 plug.notify_newdata(data)
                 if config.getint('output') & config.OUT_SHIP_EDS:
@@ -392,9 +395,14 @@ class AppWindow:
                     pass
 
                 elif not data['commander'].get('docked'):
-                    # signal as error because the user might actually be docked but the server hosting the Companion API hasn't caught up
-                    if not self.status['text']:
-                        self.status['text'] = _("You're not docked at a station!")
+                    if not event and not retrying:
+                        # Silently retry if we got here by 'Automatically update on docking' and the server hasn't caught up
+                        self.w.after(int(SERVER_RETRY * 1000), lambda:self.getandsend(event, True))
+                        return	# early exit to avoid starting cooldown count
+                    else:
+                        # Signal as error because the user might actually be docked but the server hosting the Companion API hasn't caught up
+                        if not self.status['text']:
+                            self.status['text'] = _("You're not docked at a station!")
 
                 else:
                     # Finally - the data looks sane and we're docked at a station
@@ -413,6 +421,9 @@ class AppWindow:
 
                     else:
                         if data['lastStarport'].get('commodities'):
+                            # Fixup anomalies in the commodity data
+                            self.session.fixup(data['lastStarport']['commodities'])
+
                             if config.getint('output') & config.OUT_MKT_CSV:
                                 commodity.export(data, COMMODITY_CSV)
                             if config.getint('output') & config.OUT_MKT_TD:
@@ -478,31 +489,73 @@ class AppWindow:
         except:
             pass
 
-    def system_change(self, event, timestamp, system, coordinates):
+    # Handle event(s) from the journal
+    def journal_event(self, event):
+        while monitor.event_queue:
+            entry = monitor.event_queue.pop(0)
+            system_changed = False
+            coordinates = None
 
-        if self.system['text'] != system:
-            self.system['text'] = system
+            # Update context state
+            if entry['event'] == 'Fileheader':	# XXX or 'fileheader' ?
+                self.journal_version = entry['gameversion']
+                self.journal_build = entry['build']
+            elif entry['event'] == 'LoadGame':
+                self.cmdr['text'] = self.journal_cmdr = entry['Commander']
+                self.journal_mode = entry['GameMode']
+            elif entry['event'] == 'NewCommander':
+                self.cmdr['text'] = self.journal_cmdr = entry['Name']
 
-            self.system['image'] = ''
-            self.station['text'] = EDDB.system(system) and self.STATION_UNDOCKED or ''
+            # Update main window
+            elif entry['event'] in ['Location', 'FSDJump', 'Docked']:
+                system_changed = self.system['text'] != entry['StarSystem']
+                self.system['text'] = entry['StarSystem']
+                if entry['event'] == 'Location' and entry.get('Docked', False) or entry['event'] == 'Docked':
+                    # Docked
+                    self.station['text'] = entry['StationName']
+                    if not config.getint('output') & config.OUT_MKT_MANUAL:
+                        self.w.after(int(SERVER_RETRY * 1000), self.getandsend)	# Delay in case the API server is lagging
+                else:
+                    # Not docked
+                    self.station['text'] = EDDB.system(entry['StarSystem']) and self.STATION_UNDOCKED or ''
 
-            plug.notify_system_changed(timestamp, system, coordinates)
+            plug.notify_journal_entry(self.journal_cmdr, self.system['text'], self.station['text'] != self.STATION_UNDOCKED and self.station['text'] or None, entry)
 
-            if config.getint('output') & config.OUT_SYS_EDSM:
-                try:
-                    self.status['text'] = _('Sending data to EDSM...')
-                    self.w.update_idletasks()
-                    edsm.writelog(timestamp, system, lambda:self.edsm.lookup(system, EDDB.system(system)), coordinates)	# Do EDSM lookup during EDSM export
+            if entry['event'] in ['Location', 'FSDJump', 'Docked'] and (system_changed or not coordinates):
+                system_changed = False
+                self.system['image'] = ''
+                timestamp = timegm(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
+                coordinates = 'StarPos' in entry and tuple(entry['StarPos']) or None
+
+                # Backwards compatibility
+                plug.notify_system_changed(timestamp, entry['StarSystem'], coordinates)
+
+                # Update EDSM
+                if config.getint('output') & config.OUT_SYS_EDSM:
+                    try:
+                        self.status['text'] = _('Sending data to EDSM...')
+                        self.w.update_idletasks()
+                        edsm.writelog(timestamp, entry['StarSystem'], lambda:self.edsm.lookup(entry['StarSystem'], EDDB.system(entry['StarSystem'])), coordinates)	# Do EDSM lookup during EDSM export
+                        self.status['text'] = strftime(_('Last updated at {HH}:{MM}:{SS}').format(HH='%H', MM='%M', SS='%S').encode('utf-8'), localtime(timestamp)).decode('utf-8')
+                    except Exception as e:
+                        if __debug__: print_exc()
+                        self.status['text'] = unicode(e)
+                        if not config.getint('hotkey_mute'):
+                            hotkeymgr.play_bad()
+                else:
+                    self.edsm.link(entry['StarSystem'])
                     self.status['text'] = strftime(_('Last updated at {HH}:{MM}:{SS}').format(HH='%H', MM='%M', SS='%S').encode('utf-8'), localtime(timestamp)).decode('utf-8')
-                except Exception as e:
-                    if __debug__: print_exc()
-                    self.status['text'] = unicode(e)
-                    if not config.getint('hotkey_mute'):
-                        hotkeymgr.play_bad()
-            else:
-                self.edsm.link(system)
-                self.status['text'] = strftime(_('Last updated at {HH}:{MM}:{SS}').format(HH='%H', MM='%M', SS='%S').encode('utf-8'), localtime(timestamp)).decode('utf-8')
-            self.edsmpoll()
+                self.edsmpoll()
+
+            # Send interesting events to EDDN
+            if config.getint('output') & config.OUT_SYS_EDDN and self.journal_cmdr and entry['event'] in ['FSDJump', 'Docked', 'Scan']:
+                # strip out properties disallowed by the schema
+                for thing in ['CockpitBreach', 'BoostUsed', 'FuelLevel', 'FuelUsed', 'JumpDist']:
+                    entry.pop(thing, None)
+                for thing in entry.keys():
+                    if thing.endswith('_Localised'):
+                        entry.pop(thing, None)
+                eddn.export_journal_entry(self.journal_cmdr, 'beta' in self.journal_version, entry)
 
     def edsmpoll(self):
         result = self.edsm.result

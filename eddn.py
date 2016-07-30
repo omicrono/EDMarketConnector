@@ -106,3 +106,9 @@ def export_shipyard(data):
                 'ships'       : [ship_map[ship['name'].lower()] for ship in (data['lastStarport']['ships'].get('shipyard_list') or {}).values() + data['lastStarport']['ships'].get('unavailable_list') if ship['name'].lower() in ship_map],
             }
         })
+
+def export_journal_entry(cmdr, beta, entry):
+    send(cmdr, {
+        '$schemaRef' : 'http://schemas.elite-markets.net/eddn/journal/1' + (beta and '/test' or ''),
+        'message'    : entry
+    })
